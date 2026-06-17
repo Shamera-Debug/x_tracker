@@ -1,15 +1,20 @@
 """
-X 계정 트래커 — 클라우드 수집기 (self-contained)
+X 계정 트래커 — 클라우드 수집기 (시간창 방식, 상태 저장 없음)
 ================================================================
-@dmjk001 + @jukan05 신규 트윗만 수집 → new_tweets.json
-- 쿠키: 환경변수 X_COOKIES_JSON ({"auth_token":"...","ct0":"..."})
-- 인증서: 클라우드 TLS 가로채기 프록시 우회 (--ignore-certificate-errors)
-- 상태: xtrack_state.json (리포에 커밋해 실행 간 보존). 비어있으면 자동 baseline(전송 없음)
+@dmjk001 + @jukan05 의 "직전 1시간 슬롯" 트윗만 수집 → new_tweets.json
+- 1시간마다 실행되는 루틴 전제. 매 실행은 [직전 정시, 현재 정시) 구간 트윗만 채택.
+- 상태 파일/토큰/ git push 불필요 (중복은 절대 시각 기준 비겹침 구간으로 방지).
+
+타임존 안전성:
+- X created_at 은 UTC(+0000) → _parse_created_at 이 절대 unix ts 로 변환.
+- 윈도우 경계도 UTC 정시로 계산 후 .timestamp()(절대 ts) 비교 → 타임존 혼선 없음.
+- created_kst 는 사람이 보기 위한 표시용일 뿐, 판정엔 ts 만 사용.
+
+쿠키: 환경변수 X_COOKIES_JSON ({"auth_token":"...","ct0":"..."})
+인증서: 클라우드 TLS 프록시 우회 (--ignore-certificate-errors)
 
 산출물 new_tweets.json:
-  {"collected_at_kst": "...", "accounts": [...], "total_new": N,
-   "new": {"dmjk001":[...], "jukan05":[...]}}
-각 트윗: id, author, text, created_kst, fav, rt, reply, url
+  {"collected_at_kst","window_kst","window_utc","total_new","new":{acc:[...]}}
 """
 import asyncio
 import json
@@ -24,16 +29,16 @@ sys.stdout.reconfigure(encoding="utf-8")
 from playwright.async_api import async_playwright
 
 KST = timezone(timedelta(hours=9))
+UTC = timezone.utc
 _HERE = Path(__file__).parent
-STATE_PATH = _HERE / "xtrack_state.json"
 OUT_PATH = _HERE / "new_tweets.json"
 ACCOUNTS = ["dmjk001", "jukan05"]
 GRAPHQL = ["/UserTweets", "/UserByScreenName", "/SearchTimeline"]
 UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
       "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
+WINDOW_HOURS = 1  # 루틴 실행 주기와 일치
 
 
-# ───────────── 트윗 추출 (src/x_playwright.py 로직 인라인) ─────────────
 @dataclass
 class Tweet:
     id: str
@@ -47,6 +52,7 @@ class Tweet:
 
 
 def _parse_created_at(s: str) -> int:
+    """X 타임스탬프 'Fri Apr 25 14:32:01 +0000 2026'(UTC) → 절대 unix sec."""
     if not s:
         return 0
     try:
@@ -83,21 +89,6 @@ def _extract_tweets(obj, found: dict):
             _extract_tweets(v, found)
 
 
-# ───────────── 상태 ─────────────
-def load_state() -> dict:
-    if STATE_PATH.exists():
-        try:
-            return json.loads(STATE_PATH.read_text(encoding="utf-8"))
-        except Exception:
-            pass
-    return {"accounts": {}, "last_run": ""}
-
-
-def save_state(state: dict):
-    STATE_PATH.write_text(json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8")
-
-
-# ───────────── 쿠키 ─────────────
 def load_cookies() -> dict:
     raw = os.environ.get("X_COOKIES_JSON", "").strip()
     if not raw:
@@ -110,7 +101,16 @@ def load_cookies() -> dict:
     return c
 
 
-# ───────────── X 수집 ─────────────
+def compute_window():
+    """[직전 정시, 현재 정시) 윈도우를 절대 ts 로 반환.
+    +5분 버퍼로 정시 직전/직후 지터를 흡수해 슬롯을 올바르게 판정."""
+    now = datetime.now(UTC)
+    cur_hour = (now + timedelta(minutes=5)).replace(minute=0, second=0, microsecond=0)
+    low_dt = cur_hour - timedelta(hours=WINDOW_HOURS)
+    high_dt = cur_hour
+    return low_dt, high_dt
+
+
 async def fetch_all() -> dict:
     cookies = load_cookies()
     result = {}
@@ -129,7 +129,6 @@ async def fetch_all() -> dict:
         await ctx.add_cookies(cobjs)
         page = await ctx.new_page()
 
-        # 로그인 검증
         await page.goto("https://x.com/home", wait_until="domcontentloaded", timeout=60000)
         await asyncio.sleep(3)
         if "/login" in page.url or "/i/flow/login" in page.url:
@@ -167,7 +166,7 @@ async def fetch_all() -> dict:
             rows = []
             for t in found.values():
                 if t.author.lower() != acc.lower():
-                    continue  # 본인 원글만
+                    continue
                 rows.append({
                     "id": t.id, "author": t.author, "text": t.text,
                     "created_ts": t.created_at_ts,
@@ -182,48 +181,33 @@ async def fetch_all() -> dict:
     return result
 
 
-def write_out(now: datetime, new_by_acc: dict):
+async def main():
+    low_dt, high_dt = compute_window()
+    low_ts, high_ts = low_dt.timestamp(), high_dt.timestamp()
+    now_kst = datetime.now(KST)
+    win_kst = f"{low_dt.astimezone(KST):%Y-%m-%d %H:%M} ~ {high_dt.astimezone(KST):%H:%M} KST"
+    win_utc = f"{low_dt:%Y-%m-%d %H:%M} ~ {high_dt:%H:%M} UTC"
+    print(f"=== 수집 ({now_kst:%Y-%m-%d %H:%M} KST) | 윈도우: {win_kst} ===")
+
+    fetched = await fetch_all()
+
+    new_by_acc = {}
+    for acc, rows in fetched.items():
+        new_rows = [r for r in rows if low_ts <= r["created_ts"] < high_ts]
+        new_by_acc[acc] = new_rows
+        ages = [f"{r['created_kst']}" for r in new_rows]
+        print(f"  @{acc}: 윈도우 내 {len(new_rows)}개 / 전체 {len(rows)}개 {ages}")
+
     payload = {
-        "collected_at_kst": now.strftime("%Y-%m-%d %H:%M"),
+        "collected_at_kst": now_kst.strftime("%Y-%m-%d %H:%M"),
+        "window_kst": win_kst,
+        "window_utc": win_utc,
         "accounts": ACCOUNTS,
         "total_new": sum(len(v) for v in new_by_acc.values()),
         "new": new_by_acc,
     }
     OUT_PATH.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
-
-
-async def main():
-    now = datetime.now(KST)
-    print(f"=== 수집 ({now.strftime('%Y-%m-%d %H:%M')} KST) ===")
-    state = load_state()
-
-    fetched = await fetch_all()
-
-    # 최초 실행(상태 비어있음) → baseline: 전부 seen 처리, 전송 없음
-    if not state.get("accounts"):
-        print("상태 비어있음 → 자동 BASELINE (이번엔 전송 없음)")
-        for acc, rows in fetched.items():
-            state["accounts"][acc] = {"seen": [r["id"] for r in rows][:500]}
-        state["last_run"] = now.isoformat(timespec="seconds")
-        save_state(state)
-        write_out(now, {acc: [] for acc in ACCOUNTS})
-        print("BASELINE 완료. total_new=0")
-        return
-
-    new_by_acc = {}
-    for acc, rows in fetched.items():
-        seen = set(state["accounts"].get(acc, {}).get("seen", []))
-        new_rows = [r for r in rows if r["id"] not in seen]
-        new_by_acc[acc] = new_rows
-        merged = list(dict.fromkeys([r["id"] for r in rows] + list(seen)))[:500]
-        state["accounts"].setdefault(acc, {"seen": []})["seen"] = merged
-        print(f"  @{acc}: 신규 {len(new_rows)}개 / 전체 {len(rows)}개")
-
-    state["last_run"] = now.isoformat(timespec="seconds")
-    save_state(state)
-    write_out(now, new_by_acc)
-    total = sum(len(v) for v in new_by_acc.values())
-    print(f"신규 총 {total}개 → {OUT_PATH.name}")
+    print(f"신규(윈도우 내) 총 {payload['total_new']}개 → {OUT_PATH.name}")
 
 
 if __name__ == "__main__":
