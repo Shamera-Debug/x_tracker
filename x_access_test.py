@@ -57,9 +57,17 @@ async def run():
     cookies = load_cookies()
 
     async with async_playwright() as pw:
-        browser = await pw.chromium.launch(headless=True)
-        ctx = await browser.new_context(user_agent=UA,
-                                        viewport={"width": 1280, "height": 900})
+        # 클라우드 샌드박스는 아웃바운드 HTTPS를 TLS 가로채기 프록시로 보냄
+        # → 프록시 CA 미신뢰(ERR_CERT_AUTHORITY_INVALID) 회피용 옵션
+        browser = await pw.chromium.launch(
+            headless=True,
+            args=["--ignore-certificate-errors"],
+        )
+        ctx = await browser.new_context(
+            user_agent=UA,
+            viewport={"width": 1280, "height": 900},
+            ignore_https_errors=True,
+        )
         cobjs = []
         for n, v in cookies.items():
             for dom in [".x.com", ".twitter.com"]:
