@@ -36,7 +36,7 @@ ACCOUNTS = ["dmjk001", "jukan05"]
 GRAPHQL = ["/UserTweets", "/UserByScreenName", "/SearchTimeline"]
 UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
       "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
-WINDOW_HOURS = 1  # 루틴 실행 주기와 일치
+WINDOW_HOURS = 3  # 루틴 실행 주기(cron 0 */3 * * *)와 반드시 일치. 3시간 격자는 KST·UTC 양쪽 정렬됨.
 
 
 @dataclass
@@ -102,13 +102,15 @@ def load_cookies() -> dict:
 
 
 def compute_window():
-    """[직전 정시, 현재 정시) 윈도우를 절대 ts 로 반환.
-    +5분 버퍼로 정시 직전/직후 지터를 흡수해 슬롯을 올바르게 판정."""
-    now = datetime.now(UTC)
-    cur_hour = (now + timedelta(minutes=5)).replace(minute=0, second=0, microsecond=0)
-    low_dt = cur_hour - timedelta(hours=WINDOW_HOURS)
-    high_dt = cur_hour
-    return low_dt, high_dt
+    """[직전 슬롯, 현재 슬롯) 윈도우를 절대 ts 로 반환.
+    실행 주기(WINDOW_HOURS)와 동일한 N시간 경계(UTC 0시 기준)로 정렬.
+    cron `0 */N * * *` 와 짝이 맞아야 중복/누락이 없다.
+    +5분 버퍼로 정시 직전/직후 지터를 흡수."""
+    now = datetime.now(UTC) + timedelta(minutes=5)
+    h = (now.hour // WINDOW_HOURS) * WINDOW_HOURS   # N시간 경계로 내림
+    cur_slot = now.replace(hour=h, minute=0, second=0, microsecond=0)
+    low_dt = cur_slot - timedelta(hours=WINDOW_HOURS)
+    return low_dt, cur_slot
 
 
 async def fetch_all() -> dict:
