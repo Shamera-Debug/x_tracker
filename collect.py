@@ -49,6 +49,8 @@ class Tweet:
     retweet_count: int
     reply_count: int
     url: str
+    quoted_id: str = ""   # 인용한 원글 id
+    rt_id: str = ""       # 리트윗한 원글 id
 
 
 def _parse_created_at(s: str) -> int:
@@ -61,24 +63,43 @@ def _parse_created_at(s: str) -> int:
         return 0
 
 
+def _best_text(res: dict) -> str:
+    """긴 글(note tweet)이면 전체 텍스트, 아니면 legacy full_text."""
+    nt = ((res.get("note_tweet") or {}).get("note_tweet_results") or {}).get("result") or {}
+    if isinstance(nt, dict) and nt.get("text"):
+        return nt["text"]
+    legacy = res.get("legacy") or {}
+    return legacy.get("full_text") or legacy.get("text", "")
+
+
+def _screen_name(res: dict) -> str:
+    ur = (res.get("core") or {}).get("user_results", {}).get("result", {})
+    return ((ur.get("core") or {}).get("screen_name")
+            or (ur.get("legacy") or {}).get("screen_name", ""))
+
+
 def _extract_tweets(obj, found: dict):
     if isinstance(obj, dict):
         if obj.get("__typename") == "Tweet" and isinstance(obj.get("legacy"), dict):
             try:
                 legacy = obj["legacy"]
-                ur = obj.get("core", {}).get("user_results", {}).get("result", {})
-                screen = (ur.get("core", {}).get("screen_name")
-                          or ur.get("legacy", {}).get("screen_name", ""))
+                screen = _screen_name(obj)
                 tid = legacy.get("id_str") or obj.get("rest_id", "")
                 if tid and screen and tid not in found:
+                    # 인용/리트윗 원글 id 추출
+                    quoted_id = legacy.get("quoted_status_id_str", "") or ""
+                    rt_id = ""
+                    rtr = (legacy.get("retweeted_status_result") or {}).get("result") or {}
+                    if isinstance(rtr, dict):
+                        rt_id = rtr.get("rest_id", "") or (rtr.get("legacy") or {}).get("id_str", "")
                     found[tid] = Tweet(
-                        id=str(tid), author=screen,
-                        text=legacy.get("full_text") or legacy.get("text", ""),
+                        id=str(tid), author=screen, text=_best_text(obj),
                         created_at_ts=_parse_created_at(legacy.get("created_at", "")),
                         favorite_count=int(legacy.get("favorite_count", 0) or 0),
                         retweet_count=int(legacy.get("retweet_count", 0) or 0),
                         reply_count=int(legacy.get("reply_count", 0) or 0),
                         url=f"https://x.com/{screen}/status/{tid}",
+                        quoted_id=str(quoted_id), rt_id=str(rt_id),
                     )
             except Exception:
                 pass
@@ -168,13 +189,21 @@ async def fetch_all() -> dict:
             rows = []
             for t in found.values():
                 if t.author.lower() != acc.lower():
-                    continue
+                    continue  # 본인 게시물만 (인용/리트윗 원글은 아래에서 ref로 첨부)
+                # 인용·리트윗된 원글 내용 첨부 (found 안에 이미 추출돼 있음)
+                ref_id = t.rt_id or t.quoted_id
+                ref = found.get(ref_id) if ref_id else None
+                kind = "retweet" if t.rt_id else ("quote" if t.quoted_id else "")
                 rows.append({
                     "id": t.id, "author": t.author, "text": t.text,
                     "created_ts": t.created_at_ts,
                     "created_kst": datetime.fromtimestamp(t.created_at_ts, tz=KST).strftime("%Y-%m-%d %H:%M") if t.created_at_ts else "",
                     "fav": t.favorite_count, "rt": t.retweet_count,
                     "reply": t.reply_count, "url": t.url,
+                    "repost_kind": kind,                       # "", "quote", "retweet"
+                    "ref_author": ref.author if ref else "",   # 인용/리트윗된 원글 작성자
+                    "ref_text": ref.text if ref else "",       # 원글 본문 (핵심 내용)
+                    "ref_url": ref.url if ref else "",          # 원글 링크
                 })
             rows.sort(key=lambda x: x["created_ts"], reverse=True)
             print(f"  @{acc}: {len(rows)}개 수집")
