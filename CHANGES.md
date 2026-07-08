@@ -23,7 +23,12 @@
 - 헤더 docstring의 "1시간" → "WINDOW_HOURS(현재 3)" 표기 정정.
 
 ### `requirements.txt`
-- `requests>=2.31.0` 추가. (`playwright`는 `x_access_test.py`가 아직 쓰므로 유지.)
+- `requests>=2.31.0` 추가.
+- `playwright` 제거 (2026-07-08): collect.py 가 requests 기반으로 전환돼 불필요해졌고,
+  셋업 스크립트의 `playwright install --with-deps`(apt-get update 포함)가 베이스 이미지의
+  ondrej/php PPA Label 변경으로 exit 100 실패를 유발했음. 브라우저 설치 자체가 불필요하므로
+  의존성에서 삭제. Playwright 전용 진단 스크립트 `x_access_test.py` 도 함께 삭제
+  (검증 목적은 이미 달성, 결론은 본 문서 "근본 원인" 참조).
 
 ## 인터페이스 — 변경 없음 (중요)
 - 실행 명령 동일: `python collect.py`
